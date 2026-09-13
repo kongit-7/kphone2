@@ -11,11 +11,18 @@ import WorldBroadcast from './components/WorldBroadcast';
 import ChatBroadcast from './components/ChatBroadcast';
 import { isIOSStandaloneWebApp } from './utils/iosStandalone';
 import { installDevDebugLifecycleCapture } from './utils/devDebug';
+import { startLifeRuntime } from './utils/lifeRuntime';
 
 const App: React.FC = () => {
   React.useEffect(() => {
     // 常驻监听前后台 / 焦点 / 网络事件；抓不抓由 devDebug 的 lifecycle 类勾选决定
     installDevDebugLifecycleCapture();
+  }, []);
+
+  React.useEffect(() => {
+    // Kphone Life Runtime：角色在你不聊天时也可以拥有低频、无 API 消耗的后台经历。
+    // v0.1 只记录 private Experience，不自动发消息、不产生通知。
+    return startLifeRuntime();
   }, []);
 
   const useAbsoluteShell = typeof window !== 'undefined' && isIOSStandaloneWebApp();
