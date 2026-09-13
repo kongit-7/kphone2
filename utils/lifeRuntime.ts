@@ -2,20 +2,14 @@ import { DB } from './db';
 import type { CharacterProfile } from '../types';
 
 /**
- * Kphone Life Runtime v0.1
+ * Kphone Life Runtime v0.2
  *
- * Deliberately sits above SullyOS' existing activity/chat systems.  This first
- * version does not call an LLM and never sends a message by itself.  It gives
- * each character a small amount of background time, records a lightweight
- * Experience, and exposes the result through a DOM event/local storage so the
- * future Life UI and LLM-driven Thought/Contact layers can consume it.
+ * A character's proactive message is a consequence of its background life:
+ * activity -> Experience -> (optional) Thought/Contact Decision.
  *
- * Design goals:
- * - no API calls just to keep a character "alive"
- * - no automatic messages or notifications in v0.1
- * - one character can only receive one experience per runtime tick
- * - quiet/cooldown rules prevent spam
- * - easy to replace the activity selector with an LLM later
+ * This layer intentionally keeps the Experience history separate from chat
+ * storage. The contact decision is emitted as an event so the existing chat /
+ * ActiveMsg pipeline can consume it without creating a second chat database.
  */
 
 export type LifeActivity =
@@ -34,7 +28,19 @@ export interface LifeExperience {
   title: string;
   detail: string;
   visibility: 'private';
-  source: 'life-runtime-v0.1';
+  source: 'life-runtime-v0.2';
+}
+
+export interface LifeContactDecision {
+  id: string;
+  charId: string;
+  charName: string;
+  experienceId: string;
+  createdAt: number;
+  shouldContact: boolean;
+  reason: string;
+  draftMessage?: string;
+  source: 'life-runtime-v0.2';
 }
 
 export interface LifeRuntimeSettings {
@@ -43,19 +49,25 @@ export interface LifeRuntimeSettings {
   maxExperiencesPerDay: number;
   quietStart: number;
   quietEnd: number;
+  proactiveEnabled: boolean;
+  contactCooldownMinutes: number;
 }
 
-const SETTINGS_KEY = 'kphone.life.runtime.settings.v1';
-const EXPERIENCES_KEY = 'kphone.life.runtime.experiences.v1';
-const LAST_RUN_KEY = 'kphone.life.runtime.lastRun.v1';
-const MAX_STORED_EXPERIENCES = 300;
+// v2 deliberately drops the old default quiet-hours behaviour (00:00-07:00).
+// Existing v1 settings are not migrated so a fresh default is genuinely 24/7.
+const SETTINGS_KEY = 'kphone.life.runtime.settings.v2';
+const EXPERIENCES_KEY = 'kphone.life.runtime.experiences.v2';
+const CONTACTS_KEY = 'kphone.life.runtime.contacts.v1';
+const LAST_RUN_KEY = 'kphone.life.runtime.lastRun.v2';
 
 const DEFAULT_SETTINGS: LifeRuntimeSettings = {
   enabled: true,
   intervalMinutes: 30,
   maxExperiencesPerDay: 3,
   quietStart: 0,
-  quietEnd: 7,
+  quietEnd: 0,
+  proactiveEnabled: true,
+  contactCooldownMinutes: 120,
 };
 
 const ACTIVITY_TEMPLATES: Record<LifeActivity, Array<{ title: string; detail: string }>> = {
@@ -81,6 +93,14 @@ const ACTIVITY_TEMPLATES: Record<LifeActivity, Array<{ title: string; detail: st
   ],
 };
 
+const CONTACT_DRAFTS: Record<LifeActivity, string[]> = {
+  rest: ['Had a little downtime just now.', 'Finally got a quiet minute.'],
+  browse: ['I was looking around online for a bit and found something interesting.', 'Been browsing for a while. Thought I’d tell you.'],
+  read: ['I just spent a little time reading. It was actually nice to slow down for a bit.', 'Picked up something to read for a while.'],
+  listen: ['I had some music on for a bit. Kinda nice.', 'Been listening to music for a while.'],
+  reflect: ['Was just sitting here thinking for a bit.', 'Had a random quiet moment and started thinking about things.'],
+};
+
 const readSettings = (): LifeRuntimeSettings => {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
@@ -103,9 +123,29 @@ const readExperiences = (): LifeExperience[] => {
 
 const writeExperiences = (items: LifeExperience[]) => {
   try {
-    localStorage.setItem(EXPERIENCES_KEY, JSON.stringify(items.slice(-MAX_STORED_EXPERIENCES)));
+    // No artificial application-level cap. The browser's own storage quota is
+    // the only limit; history is therefore retained rather than silently lost.
+    localStorage.setItem(EXPERIENCES_KEY, JSON.stringify(items));
   } catch {
-    // Life history is intentionally non-critical; never break the phone for it.
+    console.warn('[Kphone Life] unable to persist experience history');
+  }
+};
+
+const readContacts = (): LifeContactDecision[] => {
+  try {
+    const raw = localStorage.getItem(CONTACTS_KEY);
+    const value = raw ? JSON.parse(raw) : [];
+    return Array.isArray(value) ? value : [];
+  } catch {
+    return [];
+  }
+};
+
+const writeContacts = (items: LifeContactDecision[]) => {
+  try {
+    localStorage.setItem(CONTACTS_KEY, JSON.stringify(items));
+  } catch {
+    console.warn('[Kphone Life] unable to persist contact history');
   }
 };
 
@@ -125,8 +165,6 @@ const startOfToday = () => {
 };
 
 const chooseActivity = (character: CharacterProfile, now: Date): LifeActivity => {
-  // v0.1 is intentionally deterministic enough to feel calm rather than random
-  // spam.  A future LLM decision layer can replace this selector.
   const seed = `${character.id}:${now.getFullYear()}-${now.getMonth()}-${now.getDate()}:${now.getHours()}`;
   let hash = 0;
   for (let i = 0; i < seed.length; i += 1) hash = ((hash << 5) - hash + seed.charCodeAt(i)) | 0;
@@ -149,17 +187,64 @@ const buildExperience = (character: CharacterProfile, activity: LifeActivity, no
     title: template.title,
     detail: template.detail,
     visibility: 'private',
-    source: 'life-runtime-v0.1',
+    source: 'life-runtime-v0.2',
   };
 };
 
-const canRunForCharacter = (character: CharacterProfile, experiences: LifeExperience[], now: number, settings: LifeRuntimeSettings) => {
-  const today = startOfToday();
-  const todayCount = experiences.filter(item => item.charId === character.id && item.createdAt >= today).length;
-  if (todayCount >= settings.maxExperiencesPerDay) return false;
-  const last = experiences.filter(item => item.charId === character.id).at(-1);
-  if (last && now - last.createdAt < settings.intervalMinutes * 60_000) return false;
-  return true;
+const shouldContact = (
+  character: CharacterProfile,
+  experience: LifeExperience,
+  contacts: LifeContactDecision[],
+  settings: LifeRuntimeSettings,
+  now: number,
+): boolean => {
+  if (!settings.proactiveEnabled) return false;
+  const recent = contacts
+    .filter(item => item.charId === character.id && item.shouldContact)
+    .at(-1);
+  if (recent && now - recent.createdAt < settings.contactCooldownMinutes * 60_000) return false;
+
+  // Contact is deliberately a decision, not a timer. Some activities are more
+  // naturally shareable than others. The deterministic seed prevents repeated
+  // reloads from changing the decision for the same experience.
+  const seed = `${experience.id}:${character.id}`;
+  let hash = 0;
+  for (let i = 0; i < seed.length; i += 1) hash = ((hash << 5) - hash + seed.charCodeAt(i)) | 0;
+  const roll = Math.abs(hash) % 100;
+  const threshold: Record<LifeActivity, number> = {
+    rest: 8,
+    browse: 28,
+    read: 22,
+    listen: 30,
+    reflect: 38,
+  };
+  return roll < threshold[experience.activity];
+};
+
+const buildContactDecision = (
+  character: CharacterProfile,
+  experience: LifeExperience,
+  contacts: LifeContactDecision[],
+  settings: LifeRuntimeSettings,
+  now: number,
+): LifeContactDecision => {
+  const contact = shouldContact(character, experience, contacts, settings, now);
+  const draft = contact
+    ? CONTACT_DRAFTS[experience.activity][Math.abs(now) % CONTACT_DRAFTS[experience.activity].length]
+    : undefined;
+  return {
+    id: `life-contact-${experience.id}`,
+    charId: character.id,
+    charName: character.name || 'Character',
+    experienceId: experience.id,
+    createdAt: now,
+    shouldContact: contact,
+    reason: contact
+      ? `The experience felt naturally shareable (${experience.activity}).`
+      : `The experience did not feel worth interrupting the user for (${experience.activity}).`,
+    draftMessage: draft,
+    source: 'life-runtime-v0.2',
+  };
 };
 
 export const getLifeRuntimeSettings = (): LifeRuntimeSettings => readSettings();
@@ -173,6 +258,11 @@ export const saveLifeRuntimeSettings = (updates: Partial<LifeRuntimeSettings>) =
 
 export const getLifeExperiences = (charId?: string): LifeExperience[] => {
   const items = readExperiences();
+  return charId ? items.filter(item => item.charId === charId) : items;
+};
+
+export const getLifeContactDecisions = (charId?: string): LifeContactDecision[] => {
+  const items = readContacts();
   return charId ? items.filter(item => item.charId === charId) : items;
 };
 
@@ -198,21 +288,39 @@ export const runLifeTick = async (): Promise<LifeExperience[]> => {
   }
 
   const experiences = readExperiences();
+  const contacts = readContacts();
   const created: LifeExperience[] = [];
+  const decisions: LifeContactDecision[] = [];
 
-  // One experience per character per tick.  No LLM call, no chat message.
   for (const character of characters) {
-    if (!canRunForCharacter(character, experiences, now, settings)) continue;
-    const activity = chooseActivity(character, nowDate);
-    created.push(buildExperience(character, activity, now));
+    const todayCount = experiences.filter(item => item.charId === character.id && item.createdAt >= startOfToday()).length;
+    if (todayCount >= settings.maxExperiencesPerDay) continue;
+    const last = experiences.filter(item => item.charId === character.id).at(-1);
+    if (last && now - last.createdAt < settings.intervalMinutes * 60_000) continue;
+
+    const experience = buildExperience(character, chooseActivity(character, nowDate), now);
+    created.push(experience);
+    decisions.push(buildContactDecision(character, experience, contacts, settings, now));
   }
 
   if (created.length === 0) return [];
-  const next = [...experiences, ...created].slice(-MAX_STORED_EXPERIENCES);
-  writeExperiences(next);
+
+  const nextExperiences = [...experiences, ...created];
+  writeExperiences(nextExperiences);
+  const nextContacts = [...contacts, ...decisions];
+  writeContacts(nextContacts);
 
   for (const experience of created) {
     window.dispatchEvent(new CustomEvent('kphone-life-experience', { detail: experience }));
+  }
+
+  for (const decision of decisions) {
+    window.dispatchEvent(new CustomEvent('kphone-life-contact-decision', { detail: decision }));
+    // Only positive decisions enter the future chat/ActiveMsg bridge. Negative
+    // decisions are still stored so the character's restraint is observable.
+    if (decision.shouldContact) {
+      window.dispatchEvent(new CustomEvent('kphone-life-contact', { detail: decision }));
+    }
   }
 
   return created;
@@ -237,7 +345,6 @@ export const startLifeRuntime = () => {
     }, delay);
   };
 
-  // Run once after startup; the cooldown makes reloads harmless.
   void runLifeTick().catch(error => console.warn('[Kphone Life] initial tick failed', error));
   schedule();
 
