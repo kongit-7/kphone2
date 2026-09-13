@@ -1,5 +1,15 @@
 # 自定义 PWA 应用图标
 
+## 2026-09-13 内置图标选择
+
+默认网页图标和 PWA 图标改用用户提供的水母原画，按比例制作 180 / 192 / 512 PNG；maskable 版独立留安全边距。原来的图标文件保留，通过「外观 → 应用图标 → PWA 应用图标」选择「经典」。已有上传或链接图标不会被新版默认覆盖。
+
+经典选择仍存于 customIcons._pwa_，值为 builtin:classic；水母默认不存额外值。经典使用随包的 manifest-classic.webmanifest，与主 manifest 保持相同 start_url / scope。自定义上传继续走 blobRef 与备份管线。
+
+当前实现更新：普通浏览器和 standalone 均更新 manifest，确保安装前选择生效；旧文中“非 standalone 不更新 manifest”的描述已被本节取代。异步图标加载带版本校验，慢请求不能覆盖后一次选择或重置。
+
+回归：utils/appIcon.test.ts；scripts/test-app-icon-choice.mjs 覆盖二选一、刷新、自定义上传、重置和 320px 布局。
+
 ## 这是什么
 
 用户在「外观定制 → 应用图标」里上传一张图（或填图床链接），直接当 SullyOS 的主屏图标用。
